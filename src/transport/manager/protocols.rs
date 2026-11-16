@@ -25,7 +25,7 @@ use crate::{
 };
 
 use parking_lot::RwLock;
-use tokio::sync::mpsc::Sender;
+use tokio::sync::{mpsc::Sender, watch};
 
 use std::{
     collections::HashMap,
@@ -46,16 +46,40 @@ impl WeakProtocolRegistry {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Protocols {
     contexts: HashMap<ProtocolName, ProtocolContext>,
+    /// Bumped on every change, so that open connections can tell the protocols registered after
+    /// them.
+    changes: watch::Sender<u64>,
+    /// The value last sent on `changes`, readable without the `watch` lock.
+    generation: u64,
     /// Maps a fallback name to the main protocol name.
     fallback_names: HashMap<ProtocolName, ProtocolName>,
     keep_alives: Arc<HashMap<ProtocolName, SubstreamKeepAlive>>,
 }
 
+/// The maps derived from the installed protocols.
+type Derived = (
+    HashMap<ProtocolName, ProtocolName>,
+    Arc<HashMap<ProtocolName, SubstreamKeepAlive>>,
+);
+
 impl Protocols {
     fn new(contexts: HashMap<ProtocolName, ProtocolContext>) -> Self {
+        let (fallback_names, keep_alives) = Self::derive(&contexts);
+
+        Self {
+            contexts,
+            changes: watch::channel(0).0,
+            generation: 0,
+            fallback_names,
+            keep_alives,
+        }
+    }
+
+    /// Build the fallback-name and keep-alive maps of `contexts`.
+    fn derive(contexts: &HashMap<ProtocolName, ProtocolContext>) -> Derived {
         let fallback_names = contexts
             .iter()
             .flat_map(|(protocol, context)| {
@@ -76,11 +100,13 @@ impl Protocols {
             })
             .collect();
 
-        Self {
-            contexts,
-            fallback_names,
-            keep_alives: Arc::new(keep_alives),
-        }
+        (fallback_names, Arc::new(keep_alives))
+    }
+}
+
+impl Default for Protocols {
+    fn default() -> Self {
+        Self::new(HashMap::new())
     }
 }
 
@@ -99,8 +125,22 @@ impl ProtocolRegistry {
         let mut protocols = self.0.write();
         let mut contexts = std::mem::take(&mut protocols.contexts);
         let updated = f(&mut contexts);
-        *protocols = Protocols::new(contexts);
+        (protocols.fallback_names, protocols.keep_alives) = Protocols::derive(&contexts);
+        protocols.contexts = contexts;
+        protocols.generation += 1;
+        let generation = protocols.generation;
+        protocols.changes.send_replace(generation);
         updated
+    }
+
+    /// Number of changes to the installed protocols so far.
+    pub fn generation(&self) -> u64 {
+        self.0.read().generation
+    }
+
+    /// Changes to the installed protocols, from now on.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.0.read().changes.subscribe()
     }
 
     pub fn insert(&self, protocol: ProtocolName, context: ProtocolContext) {
@@ -122,12 +162,21 @@ impl ProtocolRegistry {
 
     /// Get the main name and the context of the protocol that `name` belongs to.
     pub fn get(&self, name: &ProtocolName) -> Option<(ProtocolName, ProtocolContext)> {
-        let protocols = self.0.read();
+        self.get_with_generation(name).0
+    }
 
-        protocols
+    /// [`Self::get`], with the [`Self::generation`] it was read at, under one lock.
+    pub fn get_with_generation(
+        &self,
+        name: &ProtocolName,
+    ) -> (Option<(ProtocolName, ProtocolContext)>, u64) {
+        let protocols = self.0.read();
+        let found = protocols
             .contexts
             .get_key_value(protocols.fallback_names.get(name).unwrap_or(name))
-            .map(|(protocol, context)| (protocol.clone(), context.clone()))
+            .map(|(protocol, context)| (protocol.clone(), context.clone()));
+
+        (found, protocols.generation)
     }
 
     /// Main names of the protocols advertised to remote peers.

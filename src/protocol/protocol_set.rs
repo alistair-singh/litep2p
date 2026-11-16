@@ -35,9 +35,10 @@ use crate::{
     PeerId,
 };
 
-use futures::Stream;
+use futures::{future::BoxFuture, stream::FuturesUnordered, Stream, StreamExt};
 use multiaddr::Multiaddr;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::{channel, Receiver, Sender, WeakSender};
+use tokio_stream::wrappers::WatchStream;
 
 #[cfg(any(feature = "quic", feature = "webrtc", feature = "websocket"))]
 use std::sync::atomic::Ordering;
@@ -229,6 +230,19 @@ pub struct ProtocolSet {
     rx: Receiver<ProtocolCommand>,
     #[allow(unused)]
     next_substream_id: Arc<AtomicUsize>,
+    /// The peer and endpoint, once the connection is established.
+    established: Option<(PeerId, Endpoint)>,
+    /// Protocols told that the connection was established. Only they are told when it closes.
+    reported: Vec<WeakSender<InnerTransportEvent>>,
+    /// Changes to the installed protocols.
+    changes: WatchStream<u64>,
+    /// The registry generation whose protocols have all been told, or are being told.
+    seen_generation: u64,
+    /// `ConnectionEstablished` events being sent to protocols registered after the connection was
+    /// established. Each resolves to the protocol it was sent to.
+    replays: FuturesUnordered<BoxFuture<'static, WeakSender<InnerTransportEvent>>>,
+    /// Protocols whose replay is still being sent.
+    pending: Vec<WeakSender<InnerTransportEvent>>,
 }
 
 impl ProtocolSet {
@@ -239,6 +253,7 @@ impl ProtocolSet {
         protocols: ProtocolRegistry,
     ) -> Self {
         let (tx, rx) = channel(256);
+        let changes = WatchStream::from_changes(protocols.subscribe());
 
         ProtocolSet {
             rx,
@@ -246,6 +261,112 @@ impl ProtocolSet {
             protocols,
             next_substream_id,
             connection: ConnectionHandle::new(connection_id, tx),
+            established: None,
+            reported: Vec::new(),
+            changes,
+            seen_generation: 0,
+            replays: FuturesUnordered::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    /// `ConnectionEstablished` for a protocol registered after the connection was established, or
+    /// `None` before it is established or once it is closing.
+    fn established_event(&self) -> Option<InnerTransportEvent> {
+        let (peer, endpoint) = self.established.as_ref()?;
+        let mut sender = self.connection.clone();
+        sender.try_upgrade();
+
+        sender.is_active().then(|| InnerTransportEvent::ConnectionEstablished {
+            peer: *peer,
+            connection: endpoint.connection_id(),
+            endpoint: endpoint.clone(),
+            sender,
+        })
+    }
+
+    fn contains(
+        list: &[WeakSender<InnerTransportEvent>],
+        tx: &Sender<InnerTransportEvent>,
+    ) -> bool {
+        list.iter()
+            .any(|weak| weak.upgrade().is_some_and(|known| known.same_channel(tx)))
+    }
+
+    /// The replay to `done` has been sent.
+    fn on_replayed(&mut self, done: WeakSender<InnerTransportEvent>) {
+        match done.upgrade() {
+            Some(done) => self.pending.retain(|pending| {
+                pending.upgrade().is_some_and(|pending| !pending.same_channel(&done))
+            }),
+            None => self.pending.retain(|pending| pending.strong_count() > 0),
+        }
+    }
+
+    /// Start telling the protocols registered since the connection was established about it, if
+    /// the registry changed since the last time.
+    fn queue_replays(&mut self) {
+        if self.established.is_none() {
+            return;
+        }
+        // Read before the senders, so that a protocol registered in between is seen next time.
+        let generation = self.protocols.generation();
+        if generation == self.seen_generation {
+            return;
+        }
+        self.seen_generation = generation;
+
+        self.reported.retain(|reported| reported.strong_count() > 0);
+        for (protocol, tx) in self.protocols.senders() {
+            if Self::contains(&self.reported, &tx) {
+                continue;
+            }
+            let Some(event) = self.established_event() else {
+                // The connection is closing; nothing new is told about it.
+                return;
+            };
+
+            tracing::trace!(
+                target: LOG_TARGET,
+                %protocol,
+                connection_id = ?self.connection.connection_id(),
+                "telling a protocol registered later about the connection",
+            );
+            let weak = tx.downgrade();
+            self.reported.push(weak.clone());
+            self.pending.push(weak.clone());
+            self.replays.push(Box::pin(async move {
+                let _ = tx.send(event).await;
+                weak
+            }));
+        }
+    }
+
+    /// Make sure the protocol behind `tx` has heard of the connection before anything else is
+    /// reported to it. Waits only on that protocol.
+    /// `generation` is the registry generation `tx` was read at.
+    async fn replay_to(&mut self, tx: &Sender<InnerTransportEvent>, generation: u64) {
+        // Every protocol of the generation seen last has been told.
+        if self.pending.is_empty() && generation == self.seen_generation {
+            return;
+        }
+
+        if Self::contains(&self.pending, tx) {
+            while Self::contains(&self.pending, tx) {
+                match self.replays.next().await {
+                    Some(done) => self.on_replayed(done),
+                    None => break,
+                }
+            }
+            return;
+        }
+
+        if Self::contains(&self.reported, tx) {
+            return;
+        }
+        if let Some(event) = self.established_event() {
+            self.reported.push(tx.downgrade());
+            let _ = tx.send(event).await;
         }
     }
 
@@ -276,10 +397,14 @@ impl ProtocolSet {
     ) -> Result<(), SubstreamError> {
         tracing::debug!(target: LOG_TARGET, %protocol, ?peer, ?direction, "substream opened");
 
-        let Some((main_protocol, protocol_context)) = self.protocols.get(&protocol) else {
+        let (found, generation) = self.protocols.get_with_generation(&protocol);
+        let Some((main_protocol, protocol_context)) = found else {
             tracing::debug!(target: LOG_TARGET, %protocol, ?peer, "protocol unregistered, dropping substream");
             return Ok(());
         };
+
+        // A protocol registered after the connection was established hears of it first.
+        self.replay_to(&protocol_context.tx, generation).await;
 
         let event = InnerTransportEvent::SubstreamOpened {
             peer,
@@ -331,8 +456,11 @@ impl ProtocolSet {
         Ok(())
     }
 
-    async fn report_to_protocols(&self, event: impl Fn() -> InnerTransportEvent) {
-        let futures = self.protocols.senders().into_iter().map(|(_, tx)| {
+    async fn report_to(
+        senders: impl IntoIterator<Item = Sender<InnerTransportEvent>>,
+        event: impl Fn() -> InnerTransportEvent,
+    ) {
+        let futures = senders.into_iter().map(|tx| {
             let event = event();
             async move {
                 let _ = tx.send(event).await;
@@ -345,7 +473,13 @@ impl ProtocolSet {
     /// Report to protocols that a connection was established.
     pub(crate) async fn report_connection_established(&mut self, peer: PeerId, endpoint: Endpoint) {
         let connection_handle = self.connection.downgrade();
-        self.report_to_protocols(|| InnerTransportEvent::ConnectionEstablished {
+        // Read before the senders, so that a protocol registered in between is replayed to.
+        self.seen_generation = self.protocols.generation();
+        let senders = self.protocols.senders().into_iter().map(|(_, tx)| tx).collect::<Vec<_>>();
+        self.reported = senders.iter().map(Sender::downgrade).collect();
+        self.established = Some((peer, endpoint.clone()));
+
+        Self::report_to(senders, || InnerTransportEvent::ConnectionEstablished {
             peer,
             connection: endpoint.connection_id(),
             endpoint: endpoint.clone(),
@@ -360,7 +494,12 @@ impl ProtocolSet {
         peer: PeerId,
         connection_id: ConnectionId,
     ) -> crate::Result<()> {
-        self.report_to_protocols(|| InnerTransportEvent::ConnectionClosed {
+        // Replays already started finish first, so that no protocol hears of the closing before
+        // the opening. Protocols registered from now on are not told.
+        while self.replays.next().await.is_some() {}
+        self.pending.clear();
+        let reported = self.reported.iter().filter_map(WeakSender::upgrade).collect::<Vec<_>>();
+        Self::report_to(reported, || InnerTransportEvent::ConnectionClosed {
             peer,
             connection: connection_id,
         })
@@ -383,7 +522,15 @@ impl Stream for ProtocolSet {
     type Item = ProtocolCommand;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.rx.poll_recv(cx)
+        let this = &mut *self;
+        while let Poll::Ready(Some(_)) = this.changes.poll_next_unpin(cx) {
+            this.queue_replays();
+        }
+        while let Poll::Ready(Some(done)) = this.replays.poll_next_unpin(cx) {
+            this.on_replayed(done);
+        }
+
+        this.rx.poll_recv(cx)
     }
 }
 
@@ -857,5 +1004,356 @@ mod tests {
             .await
             .unwrap();
         assert!(rx1.try_recv().is_err());
+    }
+
+    fn context(tx: Sender<InnerTransportEvent>) -> ProtocolContext {
+        ProtocolContext {
+            tx,
+            codec: ProtocolCodec::Identity(32),
+            fallback_names: Vec::new(),
+            keep_alive: SubstreamKeepAlive::Yes,
+            inbound: InboundProtocol::Accept,
+        }
+    }
+
+    /// A protocol set with `/notif/1` installed, over an established connection.
+    async fn established_set(
+        tx1: Sender<InnerTransportEvent>,
+    ) -> (
+        ProtocolSet,
+        ProtocolRegistry,
+        PeerId,
+        Receiver<TransportManagerEvent>,
+    ) {
+        let (tx, mgr_rx) = channel(64);
+        let registry = ProtocolRegistry::from(HashMap::from_iter([(
+            ProtocolName::from("/notif/1"),
+            context(tx1),
+        )]));
+        let mut protocol_set = ProtocolSet::new(
+            ConnectionId::from(0usize),
+            tx,
+            Default::default(),
+            registry.clone(),
+        );
+        let peer = PeerId::random();
+        protocol_set
+            .report_connection_established(
+                peer,
+                Endpoint::dialer(Multiaddr::empty(), ConnectionId::from(0usize)),
+            )
+            .await;
+
+        (protocol_set, registry, peer, mgr_rx)
+    }
+
+    /// Let the connection notice registry changes and finish the sends they start.
+    async fn drive(protocol_set: &mut ProtocolSet) {
+        for _ in 0..3 {
+            let _ = futures::poll!(protocol_set.next());
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn protocol_registered_later_is_told_once_and_of_the_close() {
+        let (tx1, mut rx1) = channel(64);
+        let (tx2, mut rx2) = channel(64);
+        let (mut protocol_set, registry, peer, _mgr_rx) = established_set(tx1).await;
+        // `/notif/1` keeps the connection open.
+        let _handle = match rx1.try_recv() {
+            Ok(InnerTransportEvent::ConnectionEstablished { sender, .. }) => sender,
+            event => panic!("invalid event received: {event:?}"),
+        };
+
+        registry.insert(ProtocolName::from("/notif/2"), context(tx2));
+        drive(&mut protocol_set).await;
+        match rx2.try_recv() {
+            Ok(InnerTransportEvent::ConnectionEstablished {
+                peer: told, sender, ..
+            }) => {
+                assert_eq!(told, peer);
+                assert!(sender.is_active());
+            }
+            event => panic!("invalid event received: {event:?}"),
+        }
+
+        // Another change doesn't tell it again.
+        let (tx3, _rx3) = channel(64);
+        registry.insert(ProtocolName::from("/notif/3"), context(tx3));
+        drive(&mut protocol_set).await;
+        assert!(rx2.try_recv().is_err());
+
+        protocol_set
+            .report_connection_closed(peer, ConnectionId::from(0usize))
+            .await
+            .unwrap();
+        assert!(std::matches!(
+            rx2.try_recv(),
+            Ok(InnerTransportEvent::ConnectionClosed { .. })
+        ));
+        assert!(rx2.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn protocol_registered_at_startup_is_not_told_twice() {
+        let (tx1, mut rx1) = channel(64);
+        let (tx2, _rx2) = channel(64);
+        let (mut protocol_set, registry, peer, _mgr_rx) = established_set(tx1).await;
+
+        registry.insert(ProtocolName::from("/notif/2"), context(tx2.clone()));
+        assert!(registry.remove(&ProtocolName::from("/notif/2"), &tx2));
+        drive(&mut protocol_set).await;
+        protocol_set
+            .report_connection_closed(peer, ConnectionId::from(0usize))
+            .await
+            .unwrap();
+
+        assert!(std::matches!(
+            rx1.try_recv(),
+            Ok(InnerTransportEvent::ConnectionEstablished { .. })
+        ));
+        assert!(std::matches!(
+            rx1.try_recv(),
+            Ok(InnerTransportEvent::ConnectionClosed { .. })
+        ));
+        assert!(rx1.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn replay_waits_for_a_full_channel_instead_of_dropping_the_event() {
+        let (tx1, _rx1) = channel(64);
+        let (tx2, mut rx2) = channel(1);
+        let (mut protocol_set, registry, peer, _mgr_rx) = established_set(tx1).await;
+        tx2.try_send(InnerTransportEvent::ConnectionClosed {
+            peer,
+            connection: ConnectionId::from(1usize),
+        })
+        .unwrap();
+
+        registry.insert(ProtocolName::from("/notif/2"), context(tx2));
+        drive(&mut protocol_set).await;
+        assert!(std::matches!(
+            rx2.try_recv(),
+            Ok(InnerTransportEvent::ConnectionClosed { .. })
+        ));
+
+        drive(&mut protocol_set).await;
+        assert!(std::matches!(
+            rx2.try_recv(),
+            Ok(InnerTransportEvent::ConnectionEstablished { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn protocol_dropped_while_its_replay_is_pending() {
+        let (tx1, mut rx1) = channel(64);
+        let (tx2, rx2) = channel(1);
+        let (mut protocol_set, registry, peer, _mgr_rx) = established_set(tx1).await;
+        tx2.try_send(InnerTransportEvent::ConnectionClosed {
+            peer,
+            connection: ConnectionId::from(1usize),
+        })
+        .unwrap();
+
+        registry.insert(ProtocolName::from("/notif/2"), context(tx2.clone()));
+        drive(&mut protocol_set).await;
+        assert!(registry.remove(&ProtocolName::from("/notif/2"), &tx2));
+        drop(tx2);
+        drop(rx2);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            protocol_set.report_connection_closed(peer, ConnectionId::from(0usize)),
+        )
+        .await
+        .expect("closing waits on a dropped protocol")
+        .unwrap();
+
+        assert!(std::matches!(
+            rx1.try_recv(),
+            Ok(InnerTransportEvent::ConnectionEstablished { .. })
+        ));
+        assert!(std::matches!(
+            rx1.try_recv(),
+            Ok(InnerTransportEvent::ConnectionClosed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn inbound_substream_of_a_protocol_registered_later_comes_after_its_connection() {
+        let (tx1, _rx1) = channel(64);
+        let (tx2, mut rx2) = channel(64);
+        let (mut protocol_set, registry, peer, _mgr_rx) = established_set(tx1).await;
+        let protocol = ProtocolName::from("/notif/2");
+
+        // The substream arrives before the connection noticed the new protocol.
+        registry.insert(protocol.clone(), context(tx2));
+        let permit = protocol_set.try_get_permit().unwrap();
+        protocol_set
+            .report_substream_open(
+                peer,
+                protocol,
+                Direction::Inbound,
+                Substream::new_mock(
+                    peer,
+                    SubstreamId::from(0usize),
+                    Box::new(MockSubstream::new()),
+                ),
+                permit,
+            )
+            .await
+            .unwrap();
+
+        assert!(std::matches!(
+            rx2.try_recv(),
+            Ok(InnerTransportEvent::ConnectionEstablished { .. })
+        ));
+        assert!(std::matches!(
+            rx2.try_recv(),
+            Ok(InnerTransportEvent::SubstreamOpened { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn closing_connection_is_not_reported_to_protocols_registered_later() {
+        let (tx1, mut rx1) = channel(64);
+        let (tx2, mut rx2) = channel(64);
+        let (mut protocol_set, registry, _peer, _mgr_rx) = established_set(tx1).await;
+
+        // `/notif/1` lets go of the connection, which then closes.
+        drop(rx1.try_recv().unwrap());
+        registry.insert(ProtocolName::from("/notif/2"), context(tx2));
+        drive(&mut protocol_set).await;
+
+        assert!(rx2.try_recv().is_err());
+    }
+
+    fn mock_substream(peer: PeerId) -> Substream {
+        Substream::new_mock(
+            peer,
+            SubstreamId::from(0usize),
+            Box::new(MockSubstream::new()),
+        )
+    }
+
+    #[tokio::test]
+    async fn protocol_registered_again_under_the_same_name_is_told() {
+        let (tx1, mut rx1) = channel(64);
+        let (mut protocol_set, registry, _peer, _mgr_rx) = established_set(tx1).await;
+        let _handle = rx1.try_recv().unwrap();
+        let protocol = ProtocolName::from("/notif/2");
+
+        let (tx2, mut rx2) = channel(64);
+        registry.insert(protocol.clone(), context(tx2.clone()));
+        drive(&mut protocol_set).await;
+        assert!(std::matches!(
+            rx2.try_recv(),
+            Ok(InnerTransportEvent::ConnectionEstablished { .. })
+        ));
+
+        // The first instance stops and a second one takes the name.
+        assert!(registry.remove(&protocol, &tx2));
+        drop(tx2);
+        drop(rx2);
+        let (tx3, mut rx3) = channel(64);
+        registry.insert(protocol, context(tx3));
+        drive(&mut protocol_set).await;
+
+        assert!(std::matches!(
+            rx3.try_recv(),
+            Ok(InnerTransportEvent::ConnectionEstablished { .. })
+        ));
+        // `/notif/1` and the second instance; the first one was pruned.
+        assert_eq!(protocol_set.reported.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn substream_does_not_wait_on_another_protocols_replay() {
+        let (tx1, mut rx1) = channel(64);
+        let (tx2, _rx2) = channel(1);
+        let (mut protocol_set, registry, peer, _mgr_rx) = established_set(tx1).await;
+        let _handle = rx1.try_recv().unwrap();
+        tx2.try_send(InnerTransportEvent::ConnectionClosed {
+            peer,
+            connection: ConnectionId::from(1usize),
+        })
+        .unwrap();
+
+        // `/notif/2`'s channel is full, so its replay waits.
+        registry.insert(ProtocolName::from("/notif/2"), context(tx2));
+        drive(&mut protocol_set).await;
+        assert_eq!(protocol_set.pending.len(), 1);
+
+        let permit = protocol_set.try_get_permit().unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            protocol_set.report_substream_open(
+                peer,
+                ProtocolName::from("/notif/1"),
+                Direction::Inbound,
+                mock_substream(peer),
+                permit,
+            ),
+        )
+        .await
+        .expect("the substream waited on another protocol's replay")
+        .unwrap();
+        assert!(std::matches!(
+            rx1.try_recv(),
+            Ok(InnerTransportEvent::SubstreamOpened { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn substream_waits_for_its_own_protocols_pending_replay() {
+        let (tx1, mut rx1) = channel(64);
+        let (tx2, mut rx2) = channel(1);
+        let (mut protocol_set, registry, peer, _mgr_rx) = established_set(tx1).await;
+        let _handle = rx1.try_recv().unwrap();
+        tx2.try_send(InnerTransportEvent::ConnectionClosed {
+            peer,
+            connection: ConnectionId::from(1usize),
+        })
+        .unwrap();
+
+        registry.insert(ProtocolName::from("/notif/2"), context(tx2));
+        drive(&mut protocol_set).await;
+        assert_eq!(protocol_set.pending.len(), 1);
+
+        let permit = protocol_set.try_get_permit().unwrap();
+        let open = protocol_set.report_substream_open(
+            peer,
+            ProtocolName::from("/notif/2"),
+            Direction::Inbound,
+            mock_substream(peer),
+            permit,
+        );
+        let receive = async {
+            let mut events = Vec::new();
+            for _ in 0..3 {
+                events.push(rx2.recv().await.unwrap());
+            }
+            events
+        };
+        let (opened, events) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(open, receive)
+        })
+        .await
+        .unwrap();
+        opened.unwrap();
+
+        assert!(std::matches!(
+            events[0],
+            InnerTransportEvent::ConnectionClosed { .. }
+        ));
+        assert!(std::matches!(
+            events[1],
+            InnerTransportEvent::ConnectionEstablished { .. }
+        ));
+        assert!(std::matches!(
+            events[2],
+            InnerTransportEvent::SubstreamOpened { .. }
+        ));
     }
 }

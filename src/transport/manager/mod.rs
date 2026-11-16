@@ -443,6 +443,11 @@ impl TransportManager {
         service
     }
 
+    /// Check if `name` is the main or a fallback name of an installed protocol.
+    pub fn is_protocol_registered(&self, name: &ProtocolName) -> bool {
+        self.protocols.contains(name)
+    }
+
     /// Acquire `TransportHandle`.
     pub fn transport_handle(&self, executor: Arc<dyn Executor>) -> TransportHandle {
         TransportHandle {
